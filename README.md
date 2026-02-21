@@ -19,7 +19,7 @@ veronica/
 └── calls/               # Post-call JSON saved by on_summary
 ```
 
-## Call Flow (Phase 1)
+## Call Flow
 
 ```
 greeting ──[confirm_identity]──┬── email_confirm    (candidate email on file)
@@ -38,7 +38,19 @@ zerobounce_check ──[validate_email]──┬── email_send_consent (valid
                                      ├── email_collection   (invalid, retries left)
                                      └── wrap_up            (retries exhausted)
 
-email_send_consent ──[process_email_consent]──── wrap_up
+email_send_consent ──[process_email_consent]──┬── confirm_address    (address on file)
+                                              └── address_collection (no address)
+
+confirm_address ──[process_address_confirmation]──┬── address_validation (confirmed)
+                                                  ├── address_collection (denied)
+                                                  └── wrap_up           (declined)
+
+address_collection ──[submit_address]──┬── address_validation (confirmed)
+                                       └── address_collection (retry readback)
+
+address_validation ──[validate_address]──┬── wrap_up            (valid / geocode error)
+                                         ├── address_collection (DPV fail, retries left)
+                                         └── wrap_up            (retries exhausted, follow-up)
 ```
 
 ## Pre-Call Enrichment
@@ -54,14 +66,14 @@ Results cached in SQLite `callers` table. Returning callers with fresh records h
 
 ## APIs
 
-| Vendor | Phase | Free Tier | Purpose |
-|--------|-------|-----------|---------|
-| Trestle Reverse Phone | 1 | — | Name, email, address, line type from ANI |
-| ZeroBounce | 1 | 100/mo | Real-time email validation mid-call |
-| Postmark | 1 | 100/mo | Confirmation email on consent |
-| Google Maps Geocoding | 1 | — | Address normalization + lat/lng |
-| Smarty US Street | 2 | 250/mo | USPS deliverability check |
-| SignalWire Messaging | 3 | — | SMS tokenized link for email collection |
+| Vendor | Free Tier | Purpose |
+|--------|-----------|---------|
+| Trestle Reverse Phone | — | Name, email, address, line type from ANI |
+| ZeroBounce | 100/mo | Real-time email validation mid-call |
+| Postmark | 100/mo | Confirmation email on consent |
+| Google Maps Geocoding | — | Address normalization + lat/lng |
+| Smarty US Street | 250/mo | USPS CASS deliverability (DPV) check |
+| SignalWire Messaging | — | SMS tokenized link for email collection (Phase 3) |
 
 ## Setup
 
@@ -78,22 +90,32 @@ SWML endpoint will be available at `http://localhost:3000/swml`. Point a SignalW
 
 ## Environment Variables
 
-See `.env.example` for the full list. Minimum for Phase 1:
+See `.env.example` for the full list. Required:
 
 - `TRESTLE_API_KEY` — Reverse phone enrichment
 - `ZEROBOUNCE_API_KEY` — Email validation
 - `SIGNALWIRE_PHONE_NUMBER` — Your SignalWire number
 - `POSTMARK_SERVER_TOKEN` + `POSTMARK_FROM_EMAIL` — Confirmation emails
-- `GOOGLE_MAPS_API_KEY` — Address geocoding
+- `GOOGLE_MAPS_API_KEY` — Address geocoding + normalization
+- `SMARTY_AUTH_ID` + `SMARTY_AUTH_TOKEN` — USPS address validation (optional, degrades gracefully)
 
 ## Consent Tracking
 
 All consent is logged to `consent_log` table with phone, call_id, type (sms/email_send), boolean, and timestamp. The agent will not send an email without explicit verbal consent.
 
+## Address Validation
+
+Address verification uses a two-stage pipeline:
+
+1. **Google Maps Geocoding** — normalizes the spoken address, returns lat/lng and confidence
+2. **Smarty US Street API** — USPS CASS validation with DPV (Delivery Point Validation) code
+
+DPV codes: `Y` = confirmed, `S` = secondary missing, `D` = drop address, `N` = not confirmed. Addresses with DPV `N` get one retry before scheduling follow-up. If Smarty is unconfigured, geocode-only results are accepted.
+
 ## Phased Build
 
-- **Phase 1** (current): Voice-only email collection, ZeroBounce validation, Postmark send, geocode enrichment
-- **Phase 2**: Address confirmation + collection with Google Maps + Smarty
+- **Phase 1** (done): Voice-only email collection, ZeroBounce validation, Postmark send, geocode enrichment
+- **Phase 2** (done): Address confirmation + collection with Google Maps geocoding + Smarty USPS validation
 - **Phase 3**: SMS email collection path (tokenized link for mobile callers)
 - **Phase 4**: Post-call async pipeline (re-check unknowns, Trestle Real Contact correlation)
 - **Phase 5**: Dashboard + follow-up trigger
