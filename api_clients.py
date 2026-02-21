@@ -15,11 +15,41 @@ logger = logging.getLogger(__name__)
 
 # ── Trestle Reverse Phone API ───────────────────────────────────────
 
+def _format_address(addr):
+    """Format a Trestle address dict into a readable string."""
+    if not isinstance(addr, dict):
+        return str(addr) if addr else None
+    parts = [
+        addr.get("street_line_1", ""),
+        addr.get("street_line_2", ""),
+        addr.get("city", ""),
+        addr.get("state_code", ""),
+        addr.get("postal_code", ""),
+    ]
+    return ", ".join(p for p in parts if p) or None
+
+
+def _parse_emails(emails):
+    """Extract email strings from Trestle emails field (string or list)."""
+    if isinstance(emails, str) and emails:
+        return [emails]
+    if isinstance(emails, list):
+        result = []
+        for e in emails:
+            if isinstance(e, dict):
+                addr = e.get("email_address") or e.get("address")
+                if addr:
+                    result.append(addr)
+            elif isinstance(e, str) and e:
+                result.append(e)
+        return result
+    return []
+
+
 def trestle_reverse_phone(phone):
     """Lookup a phone number via Trestle Reverse Phone API.
 
-    Returns dict with keys: owner_name, line_type, sms_eligible,
-    candidate_email, candidate_address, raw_response.
+    Returns a rich dict with all available caller intelligence.
     Returns None on failure.
     """
     if not config.TRESTLE_API_KEY:
@@ -41,56 +71,113 @@ def trestle_reverse_phone(phone):
         logger.error(f"Trestle API error for {phone}: {e}")
         return None
 
-    # Parse response
+    # Parse top-level phone fields
+    line_type_raw = (data.get("line_type") or "").lower()
+
     result = {
+        # Phone-level
+        "is_valid": data.get("is_valid"),
+        "line_type": line_type_raw,
+        "carrier": data.get("carrier"),
+        "is_prepaid": data.get("is_prepaid"),
+        "is_commercial": data.get("is_commercial"),
+        "sms_eligible": line_type_raw == "mobile",
+
+        # Primary owner (populated below)
         "owner_name": None,
-        "line_type": None,
-        "sms_eligible": False,
+        "firstname": None,
+        "lastname": None,
+        "middlename": None,
+        "alternate_names": [],
+        "age_range": None,
+        "gender": None,
+        "owner_type": None,
+        "confidence_score": None,
+        "link_to_phone_start_date": None,
+
+        # Contact info
         "candidate_email": None,
+        "all_emails": [],
         "candidate_address": None,
+        "all_addresses": [],
+        "alternate_phones": [],
+
+        # Lat/long from Trestle address (before Google geocode)
+        "trestle_lat": None,
+        "trestle_lng": None,
+        "trestle_accuracy": None,
+
+        # Additional owners (for identity disambiguation)
+        "owner_count": 0,
+        "all_owners_summary": [],
+
         "raw_response": data,
     }
 
-    # Line type — top-level string: Mobile, Landline, FixedVOIP, NonFixedVOIP, etc.
-    line_type_raw = data.get("line_type", "")
-    if line_type_raw:
-        result["line_type"] = line_type_raw.lower()
-
-    # SMS eligibility — only confirmed mobile
-    result["sms_eligible"] = result["line_type"] == "mobile"
-
-    # Owners array — name, emails, addresses live here
     owners = data.get("owners", [])
-    if owners:
-        owner = owners[0]
-        result["owner_name"] = owner.get("name")
+    result["owner_count"] = len(owners)
 
-        # Candidate email — owner.emails (string or array)
-        emails = owner.get("emails", [])
-        if isinstance(emails, str) and emails:
-            result["candidate_email"] = emails
-        elif isinstance(emails, list) and emails:
-            first_email = emails[0]
-            if isinstance(first_email, dict):
-                result["candidate_email"] = first_email.get("email_address") or first_email.get("address")
-            elif isinstance(first_email, str):
-                result["candidate_email"] = first_email
+    if not owners:
+        return result
 
-        # Candidate address — owner.current_addresses[]
-        addresses = owner.get("current_addresses", [])
-        if addresses:
-            addr = addresses[0]
-            if isinstance(addr, dict):
-                parts = [
-                    addr.get("street_line_1", ""),
-                    addr.get("street_line_2", ""),
-                    addr.get("city", ""),
-                    addr.get("state_code", ""),
-                    addr.get("postal_code", ""),
-                ]
-                result["candidate_address"] = ", ".join(p for p in parts if p)
-            elif isinstance(addr, str):
-                result["candidate_address"] = addr
+    # ── Primary owner (highest confidence) ───────────────────────
+    owner = owners[0]
+    result["owner_name"] = owner.get("name")
+    result["firstname"] = owner.get("firstname")
+    result["lastname"] = owner.get("lastname")
+    result["middlename"] = owner.get("middlename")
+    result["alternate_names"] = owner.get("alternate_names", [])
+    result["age_range"] = owner.get("age_range")
+    result["gender"] = owner.get("gender")
+    result["owner_type"] = owner.get("type")  # Person or Business
+    result["confidence_score"] = owner.get("phone_to_name_confidence_score")
+    result["link_to_phone_start_date"] = owner.get("link_to_phone_start_date")
+
+    # Emails — all of them, first one is candidate
+    all_emails = _parse_emails(owner.get("emails", []))
+    result["all_emails"] = all_emails
+    result["candidate_email"] = all_emails[0] if all_emails else None
+
+    # Addresses — all of them, first one is candidate
+    addresses = owner.get("current_addresses", [])
+    all_addrs = []
+    for addr in addresses:
+        formatted = _format_address(addr)
+        if formatted:
+            entry = {"formatted": formatted}
+            lat_long = addr.get("lat_long", {}) if isinstance(addr, dict) else {}
+            if lat_long:
+                entry["lat"] = lat_long.get("latitude")
+                entry["lng"] = lat_long.get("longitude")
+                entry["accuracy"] = lat_long.get("accuracy")
+            entry["delivery_point"] = addr.get("delivery_point") if isinstance(addr, dict) else None
+            entry["link_date"] = addr.get("link_to_person_start_date") if isinstance(addr, dict) else None
+            all_addrs.append(entry)
+    result["all_addresses"] = all_addrs
+    if all_addrs:
+        result["candidate_address"] = all_addrs[0]["formatted"]
+        result["trestle_lat"] = all_addrs[0].get("lat")
+        result["trestle_lng"] = all_addrs[0].get("lng")
+        result["trestle_accuracy"] = all_addrs[0].get("accuracy")
+
+    # Alternate phones
+    alt_phones = owner.get("alternate_phones", [])
+    result["alternate_phones"] = [
+        {"number": p.get("phoneNumber") or p.get("phone_number"),
+         "type": (p.get("lineType") or p.get("line_type") or "").lower()}
+        for p in alt_phones if isinstance(p, dict)
+    ]
+
+    # ── All owners summary (for multi-owner numbers) ─────────────
+    for o in owners:
+        result["all_owners_summary"].append({
+            "name": o.get("name"),
+            "confidence": o.get("phone_to_name_confidence_score"),
+            "type": o.get("type"),
+            "age_range": o.get("age_range"),
+            "email_count": len(_parse_emails(o.get("emails", []))),
+            "address_count": len(o.get("current_addresses", [])),
+        })
 
     return result
 

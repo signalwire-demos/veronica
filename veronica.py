@@ -94,6 +94,91 @@ def normalize_spoken_email(spoken):
     return text
 
 
+def _extract_trestle_extras(trestle):
+    """Build a dict of rich Trestle data for global_data / LLM context.
+
+    Only includes fields that are useful for the conversation —
+    the LLM can reference these naturally (e.g. first name, age, gender).
+    """
+    if not trestle:
+        return {}
+
+    extras = {}
+
+    # Name components — let Veronica use first name naturally
+    if trestle.get("firstname"):
+        extras["firstname"] = trestle["firstname"]
+    if trestle.get("lastname"):
+        extras["lastname"] = trestle["lastname"]
+    if trestle.get("middlename"):
+        extras["middlename"] = trestle["middlename"]
+    if trestle.get("alternate_names"):
+        extras["alternate_names"] = trestle["alternate_names"]
+
+    # Demographics
+    if trestle.get("age_range"):
+        extras["age_range"] = trestle["age_range"]
+    if trestle.get("gender"):
+        extras["gender"] = trestle["gender"]
+    if trestle.get("owner_type"):
+        extras["owner_type"] = trestle["owner_type"]
+
+    # Phone intel
+    if trestle.get("carrier"):
+        extras["carrier"] = trestle["carrier"]
+    if trestle.get("is_prepaid") is not None:
+        extras["is_prepaid"] = trestle["is_prepaid"]
+    if trestle.get("is_commercial") is not None:
+        extras["is_commercial"] = trestle["is_commercial"]
+    if trestle.get("confidence_score") is not None:
+        extras["confidence_score"] = trestle["confidence_score"]
+
+    # All emails (LLM can reference if primary is rejected)
+    if trestle.get("all_emails"):
+        extras["all_emails"] = trestle["all_emails"]
+
+    # All addresses with geocode data
+    if trestle.get("all_addresses"):
+        extras["all_addresses"] = trestle["all_addresses"]
+
+    # Alternate phones
+    if trestle.get("alternate_phones"):
+        extras["alternate_phones"] = trestle["alternate_phones"]
+
+    # Multi-owner info
+    if trestle.get("owner_count", 0) > 1:
+        extras["owner_count"] = trestle["owner_count"]
+        extras["all_owners_summary"] = trestle.get("all_owners_summary", [])
+
+    return extras
+
+
+def _log_trestle(trestle):
+    """Log rich Trestle data during pre-call enrichment."""
+    if not trestle:
+        return
+
+    logger.info(f"  trestle: name={trestle.get('owner_name')} "
+                f"({trestle.get('firstname')} {trestle.get('middlename', '')} {trestle.get('lastname')})")
+    logger.info(f"  trestle: type={trestle.get('owner_type')} "
+                f"confidence={trestle.get('confidence_score')} "
+                f"age={trestle.get('age_range')} gender={trestle.get('gender')}")
+    logger.info(f"  trestle: carrier={trestle.get('carrier')} "
+                f"prepaid={trestle.get('is_prepaid')} commercial={trestle.get('is_commercial')}")
+    logger.info(f"  trestle: emails={trestle.get('all_emails', [])}")
+    logger.info(f"  trestle: addresses={len(trestle.get('all_addresses', []))} on file")
+    for i, addr in enumerate(trestle.get("all_addresses", [])):
+        logger.info(f"  trestle:   [{i}] {addr.get('formatted')} "
+                    f"lat={addr.get('lat')} lng={addr.get('lng')}")
+    logger.info(f"  trestle: alt_phones={trestle.get('alternate_phones', [])}")
+    logger.info(f"  trestle: alt_names={trestle.get('alternate_names', [])}")
+    logger.info(f"  trestle: owners={trestle.get('owner_count', 0)}")
+    if trestle.get("owner_count", 0) > 1:
+        for o in trestle.get("all_owners_summary", []):
+            logger.info(f"  trestle:   owner: {o.get('name')} "
+                        f"confidence={o.get('confidence')} type={o.get('type')}")
+
+
 class VeronicaAgent(AgentBase):
     """Veronica Mars — AI voice agent for email & address collection."""
 
@@ -213,11 +298,13 @@ class VeronicaAgent(AgentBase):
         voice_spelling = ctx.add_step("voice_spelling")
         voice_spelling.add_section("Task", "Collect email address by voice spelling")
         voice_spelling.add_bullets("Process", [
-            "Ask the caller to spell out their email: 'Spell it out for me. Take your time.'",
-            "Listen carefully for the full email address",
-            "Read it back using NATO phonetics: 'So that's Alpha-Delta-Mike at...'",
-            "Ask them to confirm",
-            "Call submit_spelled_email with the email and whether they confirmed",
+            "Ask the caller to spell out their email address letter by letter.",
+            "Listen carefully. The caller will say individual letters, 'at' for @, 'dot' for periods.",
+            "RECONSTRUCT the email from the spoken letters — join them into a valid address. "
+            "Example: caller says 'J O H N at G M A I L dot C O M' → john@gmail.com",
+            "Fix obvious TLD errors: .con → .com, .nrt → .net, .ogr → .org",
+            "Call submit_spelled_email with the RECONSTRUCTED email (not raw speech).",
+            "The tool will read it back to you in NATO phonetics — speak that readback to the caller and ask them to confirm.",
         ])
         voice_spelling.set_functions(["submit_spelled_email"])
         voice_spelling.set_valid_steps([])
@@ -387,6 +474,46 @@ class VeronicaAgent(AgentBase):
             line_type = caller.get("line_type")
             sms_eligible = bool(caller.get("sms_eligible"))
             record_source = "returning"
+            # Rebuild extras from stored Trestle raw data so LLM gets rich context
+            trestle_extras = {}
+            stored_raw = caller.get("trestle_raw")
+            if stored_raw:
+                try:
+                    raw_parsed = json.loads(stored_raw) if isinstance(stored_raw, str) else stored_raw
+                    # Build a minimal trestle-like dict for _extract_trestle_extras
+                    from api_clients import _parse_emails, _format_address
+                    owners = raw_parsed.get("owners", [])
+                    if owners:
+                        o = owners[0]
+                        pseudo_trestle = {
+                            "firstname": o.get("firstname"),
+                            "lastname": o.get("lastname"),
+                            "middlename": o.get("middlename"),
+                            "alternate_names": o.get("alternate_names", []),
+                            "age_range": o.get("age_range"),
+                            "gender": o.get("gender"),
+                            "owner_type": o.get("type"),
+                            "confidence_score": o.get("phone_to_name_confidence_score"),
+                            "carrier": raw_parsed.get("carrier"),
+                            "is_prepaid": raw_parsed.get("is_prepaid"),
+                            "is_commercial": raw_parsed.get("is_commercial"),
+                            "all_emails": _parse_emails(o.get("emails", [])),
+                            "all_addresses": [],
+                            "alternate_phones": [
+                                {"number": p.get("phoneNumber") or p.get("phone_number"),
+                                 "type": (p.get("lineType") or p.get("line_type") or "").lower()}
+                                for p in o.get("alternate_phones", []) if isinstance(p, dict)
+                            ],
+                            "owner_count": len(owners),
+                            "all_owners_summary": [
+                                {"name": ow.get("name"), "confidence": ow.get("phone_to_name_confidence_score"),
+                                 "type": ow.get("type"), "age_range": ow.get("age_range")}
+                                for ow in owners
+                            ],
+                        }
+                        trestle_extras = _extract_trestle_extras(pseudo_trestle)
+                except Exception as e:
+                    logger.warning(f"  trestle_raw parse failed: {e}")
             logger.info(f"  path: RETURNING (fresh)")
             logger.info(f"  stored: name={owner_name} email={candidate_email} address={candidate_address}")
             logger.info(f"  stored: geocode={geocode_lat},{geocode_lng} confidence={geocode_confidence} dpv={dpv_match_code}")
@@ -416,14 +543,15 @@ class VeronicaAgent(AgentBase):
 
             trestle = trestle_reverse_phone(caller_phone)
             logger.info(f"  trestle: {'OK' if trestle else 'FAILED'}")
+            trestle_extras = {}
             if trestle:
                 owner_name = trestle["owner_name"] or caller.get("owner_name")
                 candidate_email = trestle["candidate_email"] or caller.get("validated_email") or caller.get("candidate_email")
                 candidate_address = trestle["candidate_address"] or caller.get("address_normalized") or caller.get("candidate_address")
                 line_type = trestle["line_type"] or caller.get("line_type")
                 sms_eligible = trestle["sms_eligible"]
-                logger.info(f"  trestle: name={owner_name} email={candidate_email} line_type={line_type} sms={sms_eligible}")
-                logger.info(f"  trestle: address={candidate_address}")
+                trestle_extras = _extract_trestle_extras(trestle)
+                _log_trestle(trestle)
 
                 # Geocode + Smarty if we got an address
                 address_normalized, geocode_lat, geocode_lng, geocode_confidence, dpv_match_code = \
@@ -463,14 +591,15 @@ class VeronicaAgent(AgentBase):
             logger.info(f"  path: NEW CALLER — full enrichment")
             trestle = trestle_reverse_phone(caller_phone) if caller_phone else None
             logger.info(f"  trestle: {'OK' if trestle else 'FAILED'}")
+            trestle_extras = {}
             if trestle:
                 owner_name = trestle["owner_name"]
                 candidate_email = trestle["candidate_email"]
                 candidate_address = trestle["candidate_address"]
                 line_type = trestle["line_type"]
                 sms_eligible = trestle["sms_eligible"]
-                logger.info(f"  trestle: name={owner_name} email={candidate_email} line_type={line_type} sms={sms_eligible}")
-                logger.info(f"  trestle: address={candidate_address}")
+                trestle_extras = _extract_trestle_extras(trestle)
+                _log_trestle(trestle)
 
                 # Geocode + Smarty if we got an address
                 address_normalized, geocode_lat, geocode_lng, geocode_confidence, dpv_match_code = \
@@ -507,7 +636,7 @@ class VeronicaAgent(AgentBase):
         logger.info(f"━━━ END PRE-CALL ━━━")
 
         # Populate global_data for LLM context — tools get call_id from raw_data
-        agent.set_global_data({
+        global_data = {
             "caller_phone": caller_phone,
             "owner_name": owner_name or "Unknown",
             "candidate_email": candidate_email,
@@ -515,7 +644,10 @@ class VeronicaAgent(AgentBase):
             "line_type": line_type or "unknown",
             "sms_eligible": sms_eligible,
             "record_source": record_source,
-        })
+        }
+        # Merge rich Trestle data so the LLM can reference it naturally
+        global_data.update(trestle_extras)
+        agent.set_global_data(global_data)
 
         # ── Customize greeting step ─────────────────────────────────
         ctx = agent._contexts_builder.get_context("default")
@@ -724,7 +856,13 @@ class VeronicaAgent(AgentBase):
                 "properties": {
                     "email": {
                         "type": "string",
-                        "description": "The email address as captured from the caller's spelling",
+                        "description": (
+                            "The reconstructed email address. You MUST join individual spoken letters "
+                            "into a complete email. 'at'/'at sign' → @, 'dot'/'period' → '.'. "
+                            "Fix obvious TLD errors: .con → .com, .nrt → .net, .ogr → .org. "
+                            "Example: caller says 'B R I A N at Y A H O O dot C O M' → brian@yahoo.com. "
+                            "Do NOT pass raw speech — pass the valid reconstructed email."
+                        ),
                     },
                     "confirmed": {
                         "type": "boolean",
