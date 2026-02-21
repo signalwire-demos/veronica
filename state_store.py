@@ -154,6 +154,9 @@ DEFAULT_CALL_STATE = {
     "follow_up_required": False,
     "follow_up_reason": None,
     "collected_address": None,
+    "address_source": None,
+    "address_attempts": 0,
+    "address_validation_status": None,
 }
 
 

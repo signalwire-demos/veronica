@@ -329,7 +329,7 @@ class VeronicaAgent(AgentBase):
         email_send_consent.set_functions(["process_email_consent"])
         email_send_consent.set_valid_steps([])
 
-        # CONFIRM ADDRESS (Phase 2 placeholder)
+        # CONFIRM ADDRESS
         confirm_address = ctx.add_step("confirm_address")
         confirm_address.add_section("Task", "Confirm the address on file")
         confirm_address.add_bullets("Process", [
@@ -339,18 +339,23 @@ class VeronicaAgent(AgentBase):
         confirm_address.set_functions(["process_address_confirmation"])
         confirm_address.set_valid_steps([])
 
-        # ADDRESS COLLECTION (Phase 2 placeholder)
+        # ADDRESS COLLECTION
         address_collection = ctx.add_step("address_collection")
-        address_collection.add_section("Task", "Collect the caller's address")
+        address_collection.add_section("Task", "Collect the caller's home address")
         address_collection.add_bullets("Process", [
-            "Ask: 'Where are you these days?'",
-            "Let them speak naturally, then read back the address",
-            "Call submit_address with the confirmed address",
+            "Ask: 'What's your current home address?'",
+            "Let them speak naturally — they'll give street, city, state, zip.",
+            "RECONSTRUCT the full address from what they say. "
+            "Example: caller says 'one twenty three Main Street, Springfield, Illinois, six two seven oh four' "
+            "→ 123 Main St, Springfield, IL 62704",
+            "Convert spoken numbers to digits, state names to abbreviations.",
+            "Call submit_address with the RECONSTRUCTED address.",
+            "The tool will read back a normalized version — speak that to the caller and ask them to confirm.",
         ])
         address_collection.set_functions(["submit_address"])
         address_collection.set_valid_steps([])
 
-        # ADDRESS VALIDATION (Phase 2 placeholder)
+        # ADDRESS VALIDATION
         address_validation = ctx.add_step("address_validation")
         address_validation.add_section("Task", "Validate the collected address")
         address_validation.add_bullets("Process", [
@@ -678,10 +683,10 @@ class VeronicaAgent(AgentBase):
 
         # ── Remove steps that don't apply ────────────────────────────
 
-        # Phase 1: always remove address steps (Phase 2)
-        for step_name in ["confirm_address", "address_collection", "address_validation"]:
+        # Remove confirm_address if no candidate address on file
+        if not (display_address or candidate_address):
             try:
-                ctx.remove_step(step_name)
+                ctx.remove_step("confirm_address")
             except Exception:
                 pass
 
@@ -1111,9 +1116,14 @@ class VeronicaAgent(AgentBase):
             else:
                 result = SwaigFunctionResult("Understood — no email will be sent.")
 
-            # Phase 1: wrap up (Phase 2 would route to address_collection if needed)
-            result.swml_change_step("wrap_up")
-            logger.info(f"process_email_consent: consented={consented} → wrap_up")
+            # Route to address flow
+            candidate_addr = global_data.get("candidate_address")
+            if candidate_addr:
+                result.swml_change_step("confirm_address")
+                logger.info(f"process_email_consent: consented={consented} → confirm_address")
+            else:
+                result.swml_change_step("address_collection")
+                logger.info(f"process_email_consent: consented={consented} → address_collection")
             return result
 
         # ── Phase 3 placeholder: process_sms_consent ─────────────────
@@ -1154,11 +1164,11 @@ class VeronicaAgent(AgentBase):
 
             return result
 
-        # ── Phase 2 placeholders: address tools ──────────────────────
+        # ── Address tools ─────────────────────────────────────────────
 
         @self.tool(
             name="process_address_confirmation",
-            description="Record address confirmation response (Phase 2)",
+            description="Record whether the caller confirmed, denied, or declined the address on file",
             wait_file="/sounds/typing.mp3",
             fillers={"en-US": ["Updating the file", "Got it"]},
             parameters={
@@ -1174,19 +1184,39 @@ class VeronicaAgent(AgentBase):
             },
         )
         def process_address_confirmation(args, raw_data):
-            # Phase 2 stub
+            response = args.get("response", "declined")
             call_id, global_data, caller_phone = _get_call_context(raw_data)
-            result = SwaigFunctionResult("Address noted.")
-            candidate_email = global_data.get("candidate_email")
-            if candidate_email:
-                result.swml_change_step("email_confirm")
-            else:
-                result.swml_change_step("email_collection")
-            return result
+            state = load_call_state(call_id)
+
+            logger.info(f"process_address_confirmation: response={response}")
+
+            if response == "confirmed":
+                # Use the pre-enriched address from global_data
+                address = global_data.get("candidate_address", "")
+                state["collected_address"] = address
+                state["address_source"] = "confirmed_on_file"
+                save_call_state(call_id, state)
+
+                result = SwaigFunctionResult("Address confirmed. Let me verify it.")
+                result.swml_change_step("address_validation")
+                logger.info(f"process_address_confirmation: confirmed → address_validation")
+                return result
+
+            elif response == "denied":
+                result = SwaigFunctionResult("No problem. Let's get the right one.")
+                result.swml_change_step("address_collection")
+                logger.info(f"process_address_confirmation: denied → address_collection")
+                return result
+
+            else:  # declined
+                result = SwaigFunctionResult("That's fine, we can skip that for now.")
+                result.swml_change_step("wrap_up")
+                logger.info(f"process_address_confirmation: declined → wrap_up")
+                return result
 
         @self.tool(
             name="submit_address",
-            description="Submit a caller-provided address (Phase 2)",
+            description="Submit a caller-provided address",
             wait_file="/sounds/typing.mp3",
             fillers={"en-US": ["Writing that down", "Let me get that on file"]},
             parameters={
@@ -1194,27 +1224,161 @@ class VeronicaAgent(AgentBase):
                 "properties": {
                     "address": {
                         "type": "string",
-                        "description": "The full address as spoken by the caller",
+                        "description": (
+                            "The reconstructed home address. Convert spoken numbers to digits, "
+                            "state names to abbreviations. "
+                            "Example: 'one twenty three Main Street Springfield Illinois six two seven oh four' "
+                            "→ '123 Main St, Springfield, IL 62704'. "
+                            "Pass a clean, structured address — not raw speech."
+                        ),
+                    },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "True only after the caller confirmed the readback of the normalized address",
                     },
                 },
                 "required": ["address"],
             },
         )
         def submit_address(args, raw_data):
-            result = SwaigFunctionResult("Address received. (Phase 2)")
-            result.swml_change_step("wrap_up")
+            raw_address = args.get("address", "").strip()
+            confirmed = args.get("confirmed", False)
+            call_id, global_data, caller_phone = _get_call_context(raw_data)
+            state = load_call_state(call_id)
+
+            if not raw_address:
+                result = SwaigFunctionResult("I didn't catch an address. Ask them again.")
+                result.swml_change_step("address_collection")
+                return result
+
+            # Geocode to normalize the address
+            geo = geocode_address(raw_address)
+            if geo:
+                normalized = geo["formatted_address"]
+            else:
+                normalized = raw_address  # Fall back to raw if geocode fails
+
+            if not confirmed:
+                # Cache the geocode result in state for when they confirm
+                state["pending_address"] = normalized
+                state["pending_address_raw"] = raw_address
+                if geo:
+                    state["pending_geocode"] = {
+                        "lat": geo["lat"], "lng": geo["lng"],
+                        "confidence": geo["confidence"],
+                    }
+                save_call_state(call_id, state)
+
+                result = SwaigFunctionResult(
+                    f"Read this back to the caller: '{normalized}'. "
+                    "Ask if that's correct. Then call submit_address again with confirmed=true."
+                )
+                return result
+
+            # Confirmed — store and route to validation
+            state["collected_address"] = normalized
+            state["address_source"] = "voice_collected"
+            state["address_attempts"] = state.get("address_attempts", 0) + 1
+            save_call_state(call_id, state)
+
+            result = SwaigFunctionResult("Got it.")
+            result.update_global_data({**global_data, "collected_address": normalized})
+            result.swml_change_step("address_validation")
+            logger.info(f"submit_address: confirmed '{normalized}' → address_validation")
             return result
 
         @self.tool(
             name="validate_address",
-            description="Validate collected address via geocoding (Phase 2)",
+            description="Validate collected address via geocoding and USPS. Call this immediately.",
             wait_file="/sounds/typing.mp3",
             fillers={"en-US": ["Checking that address", "Running it through the system"]},
             parameters={"type": "object", "properties": {}},
         )
         def validate_address(args, raw_data):
-            result = SwaigFunctionResult("Address validation complete. (Phase 2)")
-            result.swml_change_step("wrap_up")
+            call_id, global_data, caller_phone = _get_call_context(raw_data)
+            state = load_call_state(call_id)
+
+            address = state.get("collected_address") or global_data.get("collected_address") or global_data.get("candidate_address")
+
+            if not address:
+                result = SwaigFunctionResult("No address to validate.")
+                result.swml_change_step("address_collection")
+                return result
+
+            # Run full enrichment pipeline (geocode + Smarty)
+            normalized, lat, lng, confidence, dpv = self._enrich_address(address)
+
+            if normalized is None:
+                # Geocode failed — accept the raw address and proceed
+                state["address_validation_status"] = "geocode_error"
+                save_call_state(call_id, state)
+
+                if caller_phone:
+                    upsert_caller(caller_phone,
+                        candidate_address=address,
+                        last_call_at=datetime.now(timezone.utc).isoformat(),
+                    )
+
+                result = SwaigFunctionResult("Address noted.")
+                result.update_global_data({**global_data, "candidate_address": address})
+                result.swml_change_step("wrap_up")
+                logger.info(f"validate_address: geocode failed for '{address}', accepting → wrap_up")
+                return result
+
+            # Store enrichment results
+            if caller_phone:
+                upsert_caller(caller_phone,
+                    candidate_address=address,
+                    address_normalized=normalized,
+                    geocode_lat=lat,
+                    geocode_lng=lng,
+                    geocode_confidence=confidence,
+                    dpv_match_code=dpv,
+                    last_call_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+            # DPV check: Y = deliverable, S = secondary missing, D = drop
+            if dpv in ("Y", "S", "D", None):
+                # Valid or acceptable — proceed
+                state["address_validation_status"] = "valid"
+                save_call_state(call_id, state)
+
+                result = SwaigFunctionResult("Address checks out.")
+                result.update_global_data({
+                    **global_data,
+                    "candidate_address": normalized,
+                    "collected_address": normalized,
+                })
+                result.swml_change_step("wrap_up")
+                logger.info(f"validate_address: '{normalized}' dpv={dpv} → wrap_up")
+                return result
+
+            # DPV N or vacant — address didn't validate
+            state["address_attempts"] = state.get("address_attempts", 0) + 1
+            save_call_state(call_id, state)
+
+            if state["address_attempts"] >= 2:
+                state["follow_up_required"] = True
+                state["follow_up_reason"] = "address_validation_failed"
+                save_call_state(call_id, state)
+
+                result = SwaigFunctionResult(
+                    "Address couldn't be verified. Follow-up will be scheduled. "
+                    "Tell the caller: 'I couldn't verify that one. "
+                    "Don't worry — I'll follow up to get it sorted.'"
+                )
+                result.swml_change_step("wrap_up")
+                logger.info(f"validate_address: dpv={dpv}, retries exhausted → wrap_up")
+                return result
+
+            # Retry — back to collection
+            result = SwaigFunctionResult(
+                "That address didn't check out. Tell the caller: "
+                "'That one's not coming up in my system. Can you double-check it for me?'"
+            )
+            result.update_global_data({**global_data, "collected_address": None})
+            result.swml_change_step("address_collection")
+            logger.info(f"validate_address: dpv={dpv}, attempt {state['address_attempts']} → address_collection")
             return result
 
         # ── schedule_followup ────────────────────────────────────────
@@ -1308,6 +1472,9 @@ DEFAULT_CALL_STATE_INIT = {
     "follow_up_required": False,
     "follow_up_reason": None,
     "collected_address": None,
+    "address_source": None,
+    "address_attempts": 0,
+    "address_validation_status": None,
 }
 
 
