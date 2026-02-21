@@ -855,7 +855,7 @@ class VeronicaAgent(AgentBase):
             name="submit_spelled_email",
             description="Submit the email address the caller spelled out by voice",
             wait_file="/sounds/typing.mp3",
-            fillers={"en-US": ["Let me write that down", "Got it, one sec"]},
+            fillers={"en-US": ["Let me write that down", "Got it, one second"]},
             parameters={
                 "type": "object",
                 "properties": {
