@@ -193,6 +193,11 @@ class VeronicaAgent(AgentBase):
 
         # AI model
         self.set_param("ai_model", config.AI_MODEL)
+        self.set_param("auto_correct", True)
+        self.set_param("redact_prompt",
+            "social security numbers, credit card numbers, dates of birth, "
+            "bank account numbers, driver's license numbers"
+        )
 
         # ── Personality prompt (no routing logic) ────────────────────
         self.prompt_add_section("Identity",
@@ -231,8 +236,8 @@ class VeronicaAgent(AgentBase):
 
         # Post-prompt for call summary
         self.set_post_prompt(
-            "Summarize: caller name, email collected (or not), consent given, "
-            "any follow-up needed. Keep it to 2-3 sentences."
+            "Summarize: caller name, email collected (or not), address collected (or not), "
+            "consent given, any follow-up needed. Keep it to 2-3 sentences."
         )
 
         # State machine
@@ -894,7 +899,7 @@ class VeronicaAgent(AgentBase):
 
                 if state["spelling_attempts"] >= 3:
                     state["follow_up_required"] = True
-                    state["follow_up_reason"] = "spelling_failure"
+                    state["follow_up_reason"] = "email_not_captured"
                     save_call_state(call_id, state)
                     result = SwaigFunctionResult(
                         "Email couldn't be captured after multiple attempts. "
@@ -990,7 +995,7 @@ class VeronicaAgent(AgentBase):
             if not zb["is_invalid"]:
                 # Unknown/catch-all — proceed but flag for post-call re-check
                 state["follow_up_required"] = True
-                state["follow_up_reason"] = "email_unknown_status"
+                state["follow_up_reason"] = "email_validation_failed"
                 save_call_state(call_id, state)
                 result = SwaigFunctionResult("Email checks out.")
                 result.update_global_data({
@@ -1393,6 +1398,14 @@ class VeronicaAgent(AgentBase):
                 "properties": {
                     "reason": {
                         "type": "string",
+                        "enum": [
+                            "email_not_captured",
+                            "email_validation_failed",
+                            "address_not_captured",
+                            "address_validation_failed",
+                            "caller_refused",
+                            "other",
+                        ],
                         "description": "Reason for follow-up",
                     },
                 },
