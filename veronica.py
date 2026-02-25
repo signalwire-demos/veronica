@@ -15,6 +15,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from signalwire_agents import AgentBase
+from signalwire_agents.agent_server import AgentServer
 from signalwire_agents.core.function_result import SwaigFunctionResult
 
 import config
@@ -193,7 +194,7 @@ class VeronicaAgent(AgentBase):
 
         # AI model
         self.set_param("ai_model", config.AI_MODEL)
-        self.set_param("auto_correct", True)
+        self.set_param("enable_text_normalization", "both")
         self.set_param("redact_prompt",
             "social security numbers, credit card numbers, dates of birth, "
             "bank account numbers, driver's license numbers"
@@ -1491,6 +1492,21 @@ DEFAULT_CALL_STATE_INIT = {
 }
 
 
+def create_server():
+    """Create and configure the AgentServer."""
+    server = AgentServer(host=config.HOST, port=config.PORT)
+    server.register(VeronicaAgent(), "/swml")
+
+    # Serve static files from web/ directory
+    web_dir = Path(__file__).parent / "web"
+    if web_dir.exists():
+        server.serve_static_files(str(web_dir))
+
+    return server
+
+
+server = create_server()
+app = server.app
+
 if __name__ == "__main__":
-    agent = VeronicaAgent()
-    agent.run()
+    server.run()
